@@ -3,27 +3,53 @@ import { GraphQLDataSource, GraphQLDataSourceProcessOptions, GraphQLDataSourceRe
 import { createHash } from '@apollo/utils.createhash';
 import { ResponsePath } from '@apollo/query-planner';
 import { parseCacheControlHeader } from './parseCacheControlHeader';
-import fetcher from 'make-fetch-happen';
-import { Headers as NodeFetchHeaders, Request as NodeFetchRequest } from 'node-fetch';
 import { Fetcher, FetcherRequestInit, FetcherResponse } from '@apollo/utils.fetcher';
 import { GraphQLError, GraphQLErrorExtensions } from 'graphql';
 import { GatewayCacheHint, GatewayCachePolicy, GatewayGraphQLRequest, GatewayGraphQLRequestContext, GatewayGraphQLResponse } from '@apollo/server-gateway-interface';
 
-export class RemoteGraphQLDataSource<
+/**
+ * CloudFlare Worker compatible version of RemoteGraphQLDataSource
+ * 
+ * This version uses the global fetch API available in CloudFlare Workers
+ * instead of Node.js specific libraries like make-fetch-happen and node-fetch.
+ * 
+ * Usage:
+ * ```typescript
+ * import { CloudFlareWorkerRemoteGraphQLDataSource } from '@apollo/gateway/dist/datasources/CloudFlareWorkerRemoteGraphQLDataSource';
+ * 
+ * const gateway = new ApolloGateway({
+ *   supergraphSdl,
+ *   buildService({ url }) {
+ *     return new CloudFlareWorkerRemoteGraphQLDataSource({ url });
+ *   },
+ * });
+ * ```
+ */
+
+// CloudFlare Worker compatible fetch wrapper
+const createCloudFlareWorkerFetcher = (): Fetcher => {
+  return async (url: string, init?: FetcherRequestInit): Promise<FetcherResponse> => {
+    // Use the global fetch API available in CloudFlare Workers
+    // @ts-ignore - fetch is available in CloudFlare Workers runtime
+    const response = await fetch(url, init);
+    return response as unknown as FetcherResponse;
+  };
+};
+
+export class CloudFlareWorkerRemoteGraphQLDataSource<
   TContext extends Record<string, any> = Record<string, any>,
 > implements GraphQLDataSource<TContext>
 {
   fetcher: Fetcher;
 
   constructor(
-    config?: Partial<RemoteGraphQLDataSource<TContext>> &
+    config?: Partial<CloudFlareWorkerRemoteGraphQLDataSource<TContext>> &
       object &
-      ThisType<RemoteGraphQLDataSource<TContext>>,
+      ThisType<CloudFlareWorkerRemoteGraphQLDataSource<TContext>>,
   ) {
-    this.fetcher = fetcher.defaults({
-      maxSockets: Infinity,
-      retry: false,
-    });
+    // Use CloudFlare Worker compatible fetcher instead of make-fetch-happen
+    this.fetcher = createCloudFlareWorkerFetcher();
+    
     if (config) {
       return Object.assign(this, config);
     }
@@ -76,7 +102,9 @@ export class RemoteGraphQLDataSource<
     const context = originalContext as TContext;
 
     // Respect incoming http headers (eg, apollo-federation-include-trace).
-    const headers = new NodeFetchHeaders();
+    // Use global Headers constructor available in CloudFlare Workers
+    // @ts-ignore - Headers is available in CloudFlare Workers runtime
+    const headers = new Headers();
     if (request.http?.headers) {
       for (const [name, value] of request.http.headers) {
         headers.append(name, value);
@@ -87,7 +115,7 @@ export class RemoteGraphQLDataSource<
     request.http = {
       method: 'POST',
       url: this.url,
-      headers,
+      headers: headers as any,
     };
 
     if (this.willSendRequest) {
@@ -189,7 +217,9 @@ export class RemoteGraphQLDataSource<
     // We are careful to only send data to the overridable fetcher function that uses
     // plain JS objects --- some fetch implementations don't know how to handle
     // Request or Headers objects created by other fetch implementations.
-    const fetchRequest = new NodeFetchRequest(http.url, requestInit);
+    // Use global Request constructor available in CloudFlare Workers
+    // @ts-ignore - Request is available in CloudFlare Workers runtime
+    const fetchRequest = new Request(http.url, requestInit);
 
     let fetchResponse: FetcherResponse | undefined;
 
@@ -213,7 +243,7 @@ export class RemoteGraphQLDataSource<
         http: fetchResponse,
       };
     } catch (error) {
-      this.didEncounterError(error, fetchRequest, fetchResponse, context, request);
+      this.didEncounterError(error as Error, fetchRequest, fetchResponse, context, request);
       throw error;
     }
   }
@@ -274,7 +304,7 @@ export class RemoteGraphQLDataSource<
 
   public didEncounterError(
     error: Error,
-    _fetchRequest: NodeFetchRequest,
+    _fetchRequest: any, // Using any to avoid type conflicts with CloudFlare Worker Request type
     _fetchResponse?: FetcherResponse,
     _context?: TContext,
     _request?: GatewayGraphQLRequest,
@@ -284,7 +314,7 @@ export class RemoteGraphQLDataSource<
 
   public parseBody(
     fetchResponse: FetcherResponse,
-    _fetchRequest?: NodeFetchRequest,
+    _fetchRequest?: any, // Using any to avoid type conflicts with CloudFlare Worker Request type
     _context?: TContext,
   ): Promise<object | string> {
     const contentType = fetchResponse.headers.get('Content-Type');
@@ -321,4 +351,4 @@ export class RemoteGraphQLDataSource<
       extensions,
     });
   }
-}
+} 

@@ -1,5 +1,5 @@
 {
-  "name": "@apollo/gateway",
+  "name": "@webtales/gateway",
   "version": "2.11.0",
   "description": "Apollo Gateway",
   "author": "Apollo <packages@apollographql.com>",
@@ -46,5 +46,8 @@
   },
   "peerDependencies": {
     "graphql": "^16.5.0"
+  },
+  "devDependencies": {
+    "@types/make-fetch-happen": "^10.0.4"
   }
 }

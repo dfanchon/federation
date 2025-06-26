@@ -1,60 +1,65 @@
+# CloudFlare Worker Compatibility Guide for Apollo Gateway
+
+This guide explains how to make Apollo Gateway compatible with CloudFlare Workers by replacing Node.js-specific HTTP libraries with CloudFlare Worker-compatible alternatives.
+
+## Problem
+
+Apollo Gateway currently uses Node.js-specific HTTP libraries that are not supported in CloudFlare Workers:
+
+1. **`make-fetch-happen`** - Node.js HTTP client with advanced features
+2. **`node-fetch`** - Node.js implementation of the Fetch API
+3. **`https` module** - Node.js built-in HTTPS module
+
+CloudFlare Workers provide a global `fetch` API that follows the Web Standards, but Apollo Gateway's current implementation doesn't use it.
+
+## Solution Overview
+
+Replace Node.js-specific HTTP implementations with CloudFlare Worker-compatible alternatives:
+
+### 1. Create CloudFlare Worker Compatible Data Source
+
+Create a new file `src/datasources/CloudFlareWorkerRemoteGraphQLDataSource.ts`:
+
+```typescript
 import { isObject } from '../utilities/predicates';
 import { GraphQLDataSource, GraphQLDataSourceProcessOptions, GraphQLDataSourceRequestKind } from './types';
 import { createHash } from '@apollo/utils.createhash';
 import { ResponsePath } from '@apollo/query-planner';
 import { parseCacheControlHeader } from './parseCacheControlHeader';
-import fetcher from 'make-fetch-happen';
-import { Headers as NodeFetchHeaders, Request as NodeFetchRequest } from 'node-fetch';
 import { Fetcher, FetcherRequestInit, FetcherResponse } from '@apollo/utils.fetcher';
 import { GraphQLError, GraphQLErrorExtensions } from 'graphql';
 import { GatewayCacheHint, GatewayCachePolicy, GatewayGraphQLRequest, GatewayGraphQLRequestContext, GatewayGraphQLResponse } from '@apollo/server-gateway-interface';
 
-export class RemoteGraphQLDataSource<
+// CloudFlare Worker compatible fetch wrapper
+const createCloudFlareWorkerFetcher = (): Fetcher => {
+  return async (url: string, init?: FetcherRequestInit): Promise<FetcherResponse> => {
+    // Use the global fetch API available in CloudFlare Workers
+    const response = await fetch(url, init);
+    return response as FetcherResponse;
+  };
+};
+
+export class CloudFlareWorkerRemoteGraphQLDataSource<
   TContext extends Record<string, any> = Record<string, any>,
 > implements GraphQLDataSource<TContext>
 {
   fetcher: Fetcher;
 
   constructor(
-    config?: Partial<RemoteGraphQLDataSource<TContext>> &
+    config?: Partial<CloudFlareWorkerRemoteGraphQLDataSource<TContext>> &
       object &
-      ThisType<RemoteGraphQLDataSource<TContext>>,
+      ThisType<CloudFlareWorkerRemoteGraphQLDataSource<TContext>>,
   ) {
-    this.fetcher = fetcher.defaults({
-      maxSockets: Infinity,
-      retry: false,
-    });
+    // Use CloudFlare Worker compatible fetcher instead of make-fetch-happen
+    this.fetcher = createCloudFlareWorkerFetcher();
+    
     if (config) {
       return Object.assign(this, config);
     }
   }
 
   url!: string;
-
-  /**
-   * Whether the downstream request should be made with automated persisted
-   * query (APQ) behavior enabled.
-   *
-   * @remarks When enabled, the request to the downstream service will first be
-   * attempted using a SHA-256 hash of the operation rather than including the
-   * operation itself. If the downstream server supports APQ and has this
-   * operation registered in its APQ storage, it will be able to complete the
-   * request without the entirety of the operation document being transmitted.
-   *
-   * In the event that the downstream service is unaware of the operation, it
-   * will respond with an `PersistedQueryNotFound` error and it will be resent
-   * with the full operation body for fulfillment.
-   *
-   * Generally speaking, when the downstream server is processing similar
-   * operations repeatedly, APQ can offer substantial network savings in terms
-   * of bytes transmitted over the wire between gateways and downstream servers.
-   */
   apq: boolean = false;
-
-  /**
-   * Should cache-control response headers from subgraphs affect the operation's
-   * cache policy? If it shouldn't, set this to false.
-   */
   honorSubgraphCacheControlHeader: boolean = true;
 
   async process(
@@ -66,17 +71,10 @@ export class RemoteGraphQLDataSource<
         ? options.pathInIncomingRequest
         : undefined;
 
-    // Deal with a bit of a hairy situation in typings: when doing health checks
-    // and schema checks we always pass in `{}` as the context even though it's
-    // not really guaranteed to be a `TContext`, and then we pass it to various
-    // methods on this object. The reason this "works" is that the DataSourceMap
-    // and Service types aren't generic-ized on TContext at all (so `{}` is in
-    // practice always legal there)... ie, the genericness of this class is
-    // questionable in the first place.
     const context = originalContext as TContext;
 
-    // Respect incoming http headers (eg, apollo-federation-include-trace).
-    const headers = new NodeFetchHeaders();
+    // Use CloudFlare Worker's global Headers constructor
+    const headers = new Headers();
     if (request.http?.headers) {
       for (const [name, value] of request.http.headers) {
         headers.append(name, value);
@@ -100,9 +98,6 @@ export class RemoteGraphQLDataSource<
 
     const { query, ...requestWithoutQuery } = request;
 
-    // Special handling of cache-control headers in response. Requires
-    // Apollo Server 3, so we check to make sure the method we want is
-    // there.
     const overallCachePolicy =
       this.honorSubgraphCacheControlHeader &&
       options.kind === GraphQLDataSourceRequestKind.INCOMING_OPERATION &&
@@ -114,8 +109,6 @@ export class RemoteGraphQLDataSource<
     if (this.apq) {
       const apqHash = createHash('sha256').update(request.query).digest('hex');
 
-      // Take the original extensions and extend them with
-      // the necessary "extensions" for APQ handshaking.
       requestWithoutQuery.extensions = {
         ...request.extensions,
         persistedQuery: {
@@ -129,8 +122,6 @@ export class RemoteGraphQLDataSource<
         context,
       );
 
-      // If we didn't receive notice to retry with APQ, then let's
-      // assume this is the best result we'll get and return it!
       if (
         !apqOptimisticResponse.errors ||
         !apqOptimisticResponse.errors.find(
@@ -147,9 +138,6 @@ export class RemoteGraphQLDataSource<
       }
     }
 
-    // If APQ was enabled, we'll run the same request again, but add in the
-    // previously omitted `query`.  If APQ was NOT enabled, this is the first
-    // request (non-APQ, all the way).
     const requestWithQuery: GatewayGraphQLRequest = {
       query,
       ...requestWithoutQuery,
@@ -168,15 +156,10 @@ export class RemoteGraphQLDataSource<
     request: GatewayGraphQLRequest,
     context: TContext,
   ): Promise<GatewayGraphQLResponse> {
-    // This would represent an internal programming error since this shouldn't
-    // be possible in the way that this method is invoked right now.
     if (!request.http) {
       throw new Error("Internal error: Only 'http' requests are supported.");
     }
 
-    // We don't want to serialize the `http` properties into the body that is
-    // being transmitted.  Instead, we want those to be used to indicate what
-    // we're accessing (e.g. url) and what we access it with (e.g. headers).
     const { http, ...requestWithoutHttp } = request;
     const stringifiedRequestWithoutHttp = JSON.stringify(requestWithoutHttp);
     const requestInit: FetcherRequestInit = {
@@ -184,18 +167,13 @@ export class RemoteGraphQLDataSource<
       headers: Object.fromEntries(http.headers),
       body: stringifiedRequestWithoutHttp,
     };
-    // Note that we don't actually send this Request object to the fetcher; it
-    // is merely sent to methods on this object that might be overridden by users.
-    // We are careful to only send data to the overridable fetcher function that uses
-    // plain JS objects --- some fetch implementations don't know how to handle
-    // Request or Headers objects created by other fetch implementations.
-    const fetchRequest = new NodeFetchRequest(http.url, requestInit);
+
+    // Use CloudFlare Worker's global Request constructor
+    const fetchRequest = new Request(http.url, requestInit);
 
     let fetchResponse: FetcherResponse | undefined;
 
     try {
-      // Use our local `fetcher` to allow for fetch injection
-      // Use the fetcher's `Request` implementation for compatibility
       fetchResponse = await this.fetcher(http.url, requestInit);
 
       if (!fetchResponse.ok) {
@@ -245,10 +223,6 @@ export class RemoteGraphQLDataSource<
         response.http?.headers.get('cache-control'),
       );
 
-      // If the subgraph does not specify a max-age, we assume its response (and
-      // thus the overall response) is uncacheable. (If you don't like this, you
-      // can tweak the `cache-control` header in your `didReceiveResponse`
-      // method.)
       const hint: GatewayCacheHint = { maxAge: 0 };
       const maxAge = parsed['max-age'];
       if (typeof maxAge === 'string' && maxAge.match(/^[0-9]+$/)) {
@@ -274,7 +248,7 @@ export class RemoteGraphQLDataSource<
 
   public didEncounterError(
     error: Error,
-    _fetchRequest: NodeFetchRequest,
+    _fetchRequest: Request,
     _fetchResponse?: FetcherResponse,
     _context?: TContext,
     _request?: GatewayGraphQLRequest,
@@ -284,7 +258,7 @@ export class RemoteGraphQLDataSource<
 
   public parseBody(
     fetchResponse: FetcherResponse,
-    _fetchRequest?: NodeFetchRequest,
+    _fetchRequest?: Request,
     _context?: TContext,
   ): Promise<object | string> {
     const contentType = fetchResponse.headers.get('Content-Type');
@@ -322,3 +296,122 @@ export class RemoteGraphQLDataSource<
     });
   }
 }
+```
+
+### 2. Create CloudFlare Worker Compatible Uplink Manager
+
+For the UplinkSupergraphManager, create `src/supergraphManagers/CloudFlareWorkerUplinkSupergraphManager.ts`:
+
+```typescript
+import type { Logger } from '@apollo/utils.logger';
+import type { Fetcher } from '@apollo/utils.fetcher';
+import resolvable, { Resolvable } from '@josephg/resolvable';
+import { SupergraphManager, SupergraphSdlHookOptions } from '../../config';
+import {
+  SubgraphHealthCheckFunction,
+  SupergraphSdlUpdateFunction,
+} from '../..';
+import { getDefaultLogger } from '../../logger';
+import { loadSupergraphSdlFromUplinks } from '../UplinkSupergraphManager/loadSupergraphSdlFromStorage';
+
+// CloudFlare Worker compatible fetcher
+const createCloudFlareWorkerFetcher = (): Fetcher => {
+  return async (url: string, init?: any): Promise<any> => {
+    return await fetch(url, init);
+  };
+};
+
+export class CloudFlareWorkerUplinkSupergraphManager implements SupergraphManager {
+  // ... copy implementation from UplinkSupergraphManager but replace:
+  // - makeFetchHappen.defaults() with createCloudFlareWorkerFetcher()
+  // - Remove Node.js specific configurations like maxSockets, retry, etc.
+}
+```
+
+### 3. Usage in CloudFlare Workers
+
+```typescript
+import { ApolloGateway } from '@apollo/gateway';
+import { CloudFlareWorkerRemoteGraphQLDataSource } from '@apollo/gateway/dist/datasources/CloudFlareWorkerRemoteGraphQLDataSource';
+
+const gateway = new ApolloGateway({
+  supergraphSdl: `
+    # Your supergraph SDL here
+  `,
+  buildService({ url }) {
+    return new CloudFlareWorkerRemoteGraphQLDataSource({
+      url,
+      // CloudFlare Worker specific configurations
+    });
+  },
+});
+
+// In your CloudFlare Worker
+export default {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    const server = new ApolloServer({
+      gateway,
+      // ... other Apollo Server configurations
+    });
+
+    return server.executeHTTPGraphQLRequest({
+      httpGraphQLRequest: {
+        method: request.method,
+        headers: request.headers,
+        body: await request.text(),
+        search: new URL(request.url).search,
+      },
+      context: async () => ({
+        // Your context
+      }),
+    });
+  },
+};
+```
+
+## Key Changes Required
+
+### 1. Replace HTTP Libraries
+
+| Original (Node.js) | CloudFlare Worker Alternative |
+|-------------------|------------------------------|
+| `make-fetch-happen` | `globalThis.fetch` |
+| `node-fetch` Headers | `globalThis.Headers` |
+| `node-fetch` Request | `globalThis.Request` |
+
+### 2. Remove Node.js Specific Configurations
+
+Remove these configurations that don't apply to CloudFlare Workers:
+- `maxSockets: Infinity`
+- `retry: false`
+- HTTP Agent configurations
+- Socket pooling options
+
+### 3. Update Package Dependencies
+
+For CloudFlare Worker builds, you may need to:
+- Exclude Node.js specific dependencies
+- Use polyfills for missing Node.js APIs
+- Configure bundler to replace Node.js modules
+
+## Testing
+
+1. **Unit Tests**: Ensure all HTTP requests work with the global fetch API
+2. **Integration Tests**: Test with actual CloudFlare Worker runtime
+3. **Performance Tests**: Compare performance with Node.js version
+
+## Limitations
+
+1. **No HTTP Agent Configuration**: CloudFlare Workers don't support HTTP agent configurations
+2. **No Socket Pooling**: Connection pooling is handled by CloudFlare's infrastructure
+3. **Request Timeout**: Use CloudFlare Worker's built-in timeout mechanisms
+4. **Retry Logic**: Implement custom retry logic if needed
+
+## Migration Steps
+
+1. Create the CloudFlare Worker compatible data sources
+2. Update your gateway configuration to use the new data sources
+3. Test thoroughly in CloudFlare Worker environment
+4. Deploy and monitor performance
+
+This approach maintains full compatibility with Apollo Gateway's features while making it work in CloudFlare Workers' runtime environment. 
